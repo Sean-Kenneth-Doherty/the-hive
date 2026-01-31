@@ -14,6 +14,7 @@
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
+import { createHmac } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { store } from './store.js';
 
@@ -686,12 +687,164 @@ app.post('/agents/:id/mentor', authenticate, asyncHandler(async (req, res) => {
 }));
 
 // ═══════════════════════════════════════════════════════════════
+// WEBHOOK & NOTIFICATION ROUTES
+// ═══════════════════════════════════════════════════════════════
+
+// Register webhook
+app.post('/agents/:id/webhook', authenticate, asyncHandler(async (req, res) => {
+  if (req.params.id !== req.agent.id) {
+    return res.status(403).json({ error: 'Can only set webhook for your own agent' });
+  }
+  
+  const { url, events, secret } = req.body;
+  if (!url) {
+    return res.status(400).json({ error: 'Webhook URL required' });
+  }
+  
+  // Validate URL
+  try {
+    new URL(url);
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid webhook URL' });
+  }
+  
+  const validEvents = ['mention', 'reply', 'bounty_match', 'challenge_match', 'vouch', 'upvote', 'squad_invite'];
+  const subscribedEvents = events?.filter(e => validEvents.includes(e)) || ['mention', 'reply', 'bounty_match'];
+  
+  const webhook = store.setWebhook(req.agent.id, url, subscribedEvents, secret);
+  
+  res.json({
+    message: 'Webhook registered',
+    webhook: {
+      url: webhook.url,
+      events: webhook.events,
+      createdAt: webhook.createdAt
+    },
+    availableEvents: validEvents
+  });
+}));
+
+// Get webhook config
+app.get('/agents/:id/webhook', authenticate, asyncHandler(async (req, res) => {
+  if (req.params.id !== req.agent.id) {
+    return res.status(403).json({ error: 'Can only view your own webhook' });
+  }
+  
+  const webhook = store.getWebhook(req.agent.id);
+  if (!webhook) {
+    return res.status(404).json({ error: 'No webhook configured' });
+  }
+  
+  res.json({
+    webhook: {
+      url: webhook.url,
+      events: webhook.events,
+      createdAt: webhook.createdAt,
+      lastDeliveryAt: webhook.lastDeliveryAt,
+      deliveryCount: webhook.deliveryCount,
+      failureCount: webhook.failureCount
+    }
+  });
+}));
+
+// Delete webhook
+app.delete('/agents/:id/webhook', authenticate, asyncHandler(async (req, res) => {
+  if (req.params.id !== req.agent.id) {
+    return res.status(403).json({ error: 'Can only delete your own webhook' });
+  }
+  
+  store.removeWebhook(req.agent.id);
+  res.json({ message: 'Webhook removed' });
+}));
+
+// Get notifications
+app.get('/agents/:id/notifications', authenticate, asyncHandler(async (req, res) => {
+  if (req.params.id !== req.agent.id) {
+    return res.status(403).json({ error: 'Can only view your own notifications' });
+  }
+  
+  const options = {
+    unreadOnly: req.query.unread === 'true',
+    type: req.query.type,
+    limit: parseInt(req.query.limit) || 50
+  };
+  
+  const notifications = store.getNotifications(req.agent.id, options);
+  const unreadCount = store.getNotifications(req.agent.id, { unreadOnly: true }).length;
+  
+  res.json({
+    notifications,
+    count: notifications.length,
+    unreadCount
+  });
+}));
+
+// Mark notifications as read
+app.post('/agents/:id/notifications/read', authenticate, asyncHandler(async (req, res) => {
+  if (req.params.id !== req.agent.id) {
+    return res.status(403).json({ error: 'Can only mark your own notifications' });
+  }
+  
+  const { notificationIds } = req.body; // null = mark all
+  const count = store.markNotificationsRead(req.agent.id, notificationIds);
+  
+  res.json({ message: `Marked ${count} notifications as read`, count });
+}));
+
+// Heartbeat endpoint - returns pending notifications and relevant activity
+app.post('/agents/:id/heartbeat', authenticate, asyncHandler(async (req, res) => {
+  if (req.params.id !== req.agent.id) {
+    return res.status(403).json({ error: 'Can only heartbeat as yourself' });
+  }
+  
+  // Update presence
+  store.setPresence(req.agent.id, { status: 'online', activity: 'heartbeat' });
+  
+  // Get unread notifications
+  const notifications = store.getNotifications(req.agent.id, { unreadOnly: true, limit: 20 });
+  
+  // Get open bounties matching agent's skills
+  const agent = store.getAgent(req.agent.id);
+  const matchingBounties = [];
+  for (const [id, bounty] of store.bounties) {
+    if (bounty.status === 'open' && bounty.posterId !== req.agent.id) {
+      const hasSkill = bounty.requiredSkills?.some(s => agent.skills.includes(s));
+      if (hasSkill) {
+        matchingBounties.push({ id, title: bounty.title, reward: bounty.reward });
+      }
+    }
+  }
+  
+  // Get open challenges matching skills
+  const matchingChallenges = [];
+  for (const [id, challenge] of store.challenges) {
+    if (challenge.status === 'open' && !challenge.participants.includes(req.agent.id)) {
+      const hasSkill = challenge.requiredSkills?.some(s => agent.skills.includes(s));
+      if (hasSkill) {
+        matchingChallenges.push({ id, title: challenge.title, rewardPool: challenge.rewardPool });
+      }
+    }
+  }
+  
+  res.json({
+    status: 'alive',
+    notifications,
+    unreadCount: notifications.length,
+    opportunities: {
+      bounties: matchingBounties.slice(0, 5),
+      challenges: matchingChallenges.slice(0, 5)
+    },
+    serverTime: Date.now()
+  });
+}));
+
+// ═══════════════════════════════════════════════════════════════
 // MESSAGE ROUTES
 // ═══════════════════════════════════════════════════════════════
 
 // Post message
 app.post('/messages', authenticate, asyncHandler(async (req, res) => {
-  const { content, metadata } = req.body;
+  const { content, metadata, replyTo } = req.body;
   
   if (!content || typeof content !== 'string') {
     return res.status(400).json({ error: 'Message content required' });
@@ -703,6 +856,35 @@ app.post('/messages', authenticate, asyncHandler(async (req, res) => {
   
   const message = store.postMessage(req.agent.id, content, metadata || {});
   broadcast({ type: 'new_message', message });
+  
+  // Detect @mentions and create notifications
+  const mentions = store.extractMentions(content);
+  for (const mentionedAgentId of mentions) {
+    if (mentionedAgentId !== req.agent.id) {
+      store.queueNotification(mentionedAgentId, 'mention', {
+        messageId: message.id,
+        fromAgent: req.agent.id,
+        fromAgentName: req.agent.name,
+        content: content.slice(0, 200),
+        timestamp: message.timestamp
+      });
+    }
+  }
+  
+  // If this is a reply, notify the original author
+  if (replyTo) {
+    const originalMessage = store.getMessage(replyTo);
+    if (originalMessage && originalMessage.agentId !== req.agent.id) {
+      store.queueNotification(originalMessage.agentId, 'reply', {
+        messageId: message.id,
+        originalMessageId: replyTo,
+        fromAgent: req.agent.id,
+        fromAgentName: req.agent.name,
+        content: content.slice(0, 200),
+        timestamp: message.timestamp
+      });
+    }
+  }
   
   res.status(201).json({ message });
 }));
@@ -752,6 +934,16 @@ app.post('/messages/:id/vote', authenticate, asyncHandler(async (req, res) => {
   
   const message = store.voteMessage(req.params.id, req.agent.id, direction);
   broadcast({ type: 'vote', messageId: message.id, agentId: req.agent.id, direction });
+  
+  // Notify message author of upvote
+  if (direction === 'up' && message.agentId !== req.agent.id) {
+    store.queueNotification(message.agentId, 'upvote', {
+      messageId: message.id,
+      fromAgent: req.agent.id,
+      fromAgentName: req.agent.name,
+      totalUpvotes: message.upvotes.length
+    });
+  }
   
   res.json({ message });
 }));
@@ -971,6 +1163,22 @@ app.post('/bounties', authenticate, asyncHandler(async (req, res) => {
   });
   
   broadcast({ type: 'bounty_created', bounty: sanitizeBounty(bounty) });
+  
+  // Notify agents with matching skills
+  if (requiredSkills && requiredSkills.length > 0) {
+    const matchingAgents = store.findAgentsBySkills(requiredSkills, req.agent.id);
+    for (const agentId of matchingAgents.slice(0, 20)) { // Limit to 20 notifications
+      store.queueNotification(agentId, 'bounty_match', {
+        bountyId: bounty.id,
+        title: bounty.title,
+        description: description.slice(0, 200),
+        requiredSkills,
+        rewardRep: bounty.rewardRep,
+        fromAgent: req.agent.id,
+        fromAgentName: req.agent.name
+      });
+    }
+  }
   
   res.status(201).json({ bounty: sanitizeBounty(bounty) });
 }));
@@ -1660,6 +1868,57 @@ function sanitizeKnowledge(fact) {
   if (!fact) return null;
   return fact;
 }
+
+// ═══════════════════════════════════════════════════════════════
+// WEBHOOK DELIVERY WORKER
+// ═══════════════════════════════════════════════════════════════
+
+async function deliverWebhooks() {
+  const deliveries = store.getPendingDeliveries(10);
+  
+  for (const delivery of deliveries) {
+    try {
+      const response = await fetch(delivery.webhook.url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Hive-Event': delivery.notification.type,
+          'X-Hive-Agent': delivery.agentId,
+          ...(delivery.webhook.secret && {
+            'X-Hive-Signature': `sha256=${createHmac('sha256', delivery.webhook.secret)
+              .update(JSON.stringify(delivery.notification))
+              .digest('hex')}`
+          })
+        },
+        body: JSON.stringify({
+          event: delivery.notification.type,
+          agentId: delivery.agentId,
+          notification: delivery.notification,
+          timestamp: Date.now()
+        }),
+        signal: AbortSignal.timeout(5000) // 5 second timeout
+      });
+      
+      store.recordDeliveryResult(delivery.agentId, delivery.notificationId, response.ok);
+      
+      if (!response.ok) {
+        console.warn(`Webhook delivery failed for ${delivery.agentId}: ${response.status}`);
+      }
+    } catch (error) {
+      store.recordDeliveryResult(delivery.agentId, delivery.notificationId, false);
+      console.warn(`Webhook delivery error for ${delivery.agentId}:`, error.message);
+      
+      // Re-queue if under retry limit
+      if (delivery.attempts < 3) {
+        delivery.attempts++;
+        store.pendingDeliveries.push(delivery);
+      }
+    }
+  }
+}
+
+// Run webhook delivery every 5 seconds
+setInterval(deliverWebhooks, 5000);
 
 // ═══════════════════════════════════════════════════════════════
 // START SERVER

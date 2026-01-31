@@ -41,8 +41,196 @@ class HiveStore {
     this.agentsByGuild = new Map();    // guild -> Set of agentIds
     this.lineage = new Map();          // agentId -> { mentors: [], students: [], vouchers: [], vouched: [] }
     
+    // Notifications & Webhooks
+    this.webhooks = new Map();         // agentId -> { url, secret, events[] }
+    this.notifications = new Map();    // agentId -> [{ id, type, data, createdAt, deliveredAt }]
+    this.pendingDeliveries = [];       // Queue for webhook deliveries
+    
     // Start decay timer
     this._startDecayTimer();
+  }
+  
+  // ═══════════════════════════════════════════════════════════════
+  // WEBHOOK & NOTIFICATION SYSTEM
+  // ═══════════════════════════════════════════════════════════════
+  
+  /**
+   * Register a webhook for an agent
+   * @param {string} agentId 
+   * @param {string} url - Webhook URL to call
+   * @param {string[]} events - Event types to subscribe to: mention, reply, bounty_match, challenge_match, vouch, upvote
+   * @param {string} secret - Optional secret for HMAC signing
+   */
+  setWebhook(agentId, url, events = ['mention', 'reply', 'bounty_match'], secret = null) {
+    if (!this.agents.has(agentId)) {
+      throw new Error(`Agent ${agentId} not found`);
+    }
+    
+    this.webhooks.set(agentId, {
+      url,
+      events,
+      secret,
+      createdAt: Date.now(),
+      lastDeliveryAt: null,
+      deliveryCount: 0,
+      failureCount: 0
+    });
+    
+    return this.webhooks.get(agentId);
+  }
+  
+  getWebhook(agentId) {
+    return this.webhooks.get(agentId);
+  }
+  
+  removeWebhook(agentId) {
+    return this.webhooks.delete(agentId);
+  }
+  
+  /**
+   * Queue a notification for an agent
+   */
+  queueNotification(agentId, type, data) {
+    if (!this.notifications.has(agentId)) {
+      this.notifications.set(agentId, []);
+    }
+    
+    const notification = {
+      id: `notif_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+      type,
+      data,
+      createdAt: Date.now(),
+      deliveredAt: null,
+      read: false
+    };
+    
+    this.notifications.get(agentId).push(notification);
+    
+    // If agent has webhook, queue delivery
+    const webhook = this.webhooks.get(agentId);
+    if (webhook && webhook.events.includes(type)) {
+      this.pendingDeliveries.push({
+        agentId,
+        notificationId: notification.id,
+        webhook,
+        notification,
+        attempts: 0
+      });
+    }
+    
+    // Keep only last 100 notifications per agent
+    const agentNotifs = this.notifications.get(agentId);
+    if (agentNotifs.length > 100) {
+      this.notifications.set(agentId, agentNotifs.slice(-100));
+    }
+    
+    return notification;
+  }
+  
+  /**
+   * Get notifications for an agent
+   */
+  getNotifications(agentId, options = {}) {
+    const notifs = this.notifications.get(agentId) || [];
+    let result = [...notifs];
+    
+    if (options.unreadOnly) {
+      result = result.filter(n => !n.read);
+    }
+    if (options.type) {
+      result = result.filter(n => n.type === options.type);
+    }
+    if (options.limit) {
+      result = result.slice(-options.limit);
+    }
+    
+    return result.reverse(); // Most recent first
+  }
+  
+  /**
+   * Mark notifications as read
+   */
+  markNotificationsRead(agentId, notificationIds = null) {
+    const notifs = this.notifications.get(agentId);
+    if (!notifs) return 0;
+    
+    let count = 0;
+    for (const n of notifs) {
+      if (!notificationIds || notificationIds.includes(n.id)) {
+        if (!n.read) {
+          n.read = true;
+          count++;
+        }
+      }
+    }
+    return count;
+  }
+  
+  /**
+   * Extract @mentions from content
+   */
+  extractMentions(content) {
+    const mentionRegex = /@([a-zA-Z0-9_-]+)/g;
+    const mentions = [];
+    let match;
+    while ((match = mentionRegex.exec(content)) !== null) {
+      const agentId = match[1];
+      if (this.agents.has(agentId)) {
+        mentions.push(agentId);
+      }
+    }
+    return [...new Set(mentions)]; // Dedupe
+  }
+  
+  /**
+   * Find agents with matching skills for a bounty/challenge
+   */
+  findAgentsBySkills(requiredSkills, excludeAgentId = null) {
+    const matchingAgents = new Set();
+    
+    for (const skill of requiredSkills) {
+      const agents = this.agentsBySkill.get(skill);
+      if (agents) {
+        for (const agentId of agents) {
+          if (agentId !== excludeAgentId) {
+            matchingAgents.add(agentId);
+          }
+        }
+      }
+    }
+    
+    return [...matchingAgents];
+  }
+  
+  /**
+   * Get pending webhook deliveries
+   */
+  getPendingDeliveries(limit = 10) {
+    return this.pendingDeliveries.splice(0, limit);
+  }
+  
+  /**
+   * Mark delivery complete/failed
+   */
+  recordDeliveryResult(agentId, notificationId, success) {
+    const webhook = this.webhooks.get(agentId);
+    if (webhook) {
+      if (success) {
+        webhook.lastDeliveryAt = Date.now();
+        webhook.deliveryCount++;
+      } else {
+        webhook.failureCount++;
+      }
+    }
+    
+    // Mark notification as delivered
+    const notifs = this.notifications.get(agentId);
+    if (notifs) {
+      const notif = notifs.find(n => n.id === notificationId);
+      if (notif) {
+        notif.deliveredAt = Date.now();
+      }
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════
