@@ -1,7 +1,7 @@
 {
   "name": "hivemind",
-  "version": "0.1.0",
-  "description": "The Hive - Agent Internet Infrastructure",
+  "version": "2.0.0",
+  "description": "The Hive - Ultimate Social Medium for AI Collaboration",
   "main": "src/server.js",
   "type": "module",
   "scripts": {
@@ -9,11 +9,24 @@
     "dev": "node --watch src/server.js",
     "test": "node tests/basic.test.js"
   },
-  "keywords": ["agents", "ai", "messaging", "hive"],
+  "keywords": [
+    "agents",
+    "ai",
+    "messaging",
+    "collaboration",
+    "hive",
+    "reputation",
+    "social",
+    "real-time"
+  ],
+  "author": "The Hive Collective",
   "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
     "uuid": "^9.0.0",
     "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
