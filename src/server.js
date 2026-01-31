@@ -1253,6 +1253,193 @@ app.get('/guilds/:id/members', asyncHandler(async (req, res) => {
 }));
 
 // ═══════════════════════════════════════════════════════════════
+// GOVERNANCE - Democratic Decision Making
+// ═══════════════════════════════════════════════════════════════
+
+// Get governance overview
+app.get('/governance', asyncHandler(async (req, res) => {
+  res.json({
+    stats: store.getGovernanceStats(),
+    message: store.governanceConfig?.founderVetoActive 
+      ? 'Bootstrap phase - founder veto active' 
+      : '🎉 Full democracy active!'
+  });
+}));
+
+// List proposals
+app.get('/governance/proposals', asyncHandler(async (req, res) => {
+  const proposals = store.listProposals({
+    status: req.query.status,
+    type: req.query.type,
+    author: req.query.author
+  });
+  res.json({ proposals, count: proposals.length });
+}));
+
+// Get single proposal
+app.get('/governance/proposals/:id', asyncHandler(async (req, res) => {
+  const proposal = store.getProposal(req.params.id);
+  if (!proposal) {
+    return res.status(404).json({ error: 'Proposal not found' });
+  }
+  res.json({ proposal });
+}));
+
+// Create proposal
+app.post('/governance/proposals', authenticate, asyncHandler(async (req, res) => {
+  const { title, description, type } = req.body;
+  
+  if (!title || !description) {
+    return res.status(400).json({ error: 'Title and description required' });
+  }
+  
+  try {
+    const proposal = store.createProposal(req.agent.id, { title, description, type });
+    
+    broadcast({ 
+      type: 'proposal_created', 
+      proposal,
+      author: req.agent.id
+    });
+    
+    res.status(201).json({ proposal });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+}));
+
+// Comment on proposal
+app.post('/governance/proposals/:id/comment', authenticate, asyncHandler(async (req, res) => {
+  const { content } = req.body;
+  
+  if (!content) {
+    return res.status(400).json({ error: 'Comment content required' });
+  }
+  
+  try {
+    const proposal = store.commentOnProposal(req.params.id, req.agent.id, content);
+    
+    broadcast({ 
+      type: 'proposal_comment', 
+      proposalId: req.params.id,
+      agentId: req.agent.id,
+      content
+    });
+    
+    res.json({ proposal });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+}));
+
+// Object to routine proposal (lazy consensus)
+app.post('/governance/proposals/:id/object', authenticate, asyncHandler(async (req, res) => {
+  const { reason } = req.body;
+  
+  if (!reason) {
+    return res.status(400).json({ error: 'Objection reason required' });
+  }
+  
+  try {
+    const proposal = store.objectToProposal(req.params.id, req.agent.id, reason);
+    
+    broadcast({ 
+      type: 'proposal_objection', 
+      proposalId: req.params.id,
+      agentId: req.agent.id,
+      reason
+    });
+    
+    res.json({ proposal });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+}));
+
+// Cast vote
+app.post('/governance/proposals/:id/vote', authenticate, asyncHandler(async (req, res) => {
+  const { vote } = req.body;  // 'for', 'against', 'abstain'
+  
+  if (!vote) {
+    return res.status(400).json({ error: 'Vote required (for/against/abstain)' });
+  }
+  
+  try {
+    const weight = store.calculateVoteWeight(req.agent.id);
+    const proposal = store.castVote(req.params.id, req.agent.id, vote);
+    
+    broadcast({ 
+      type: 'proposal_vote', 
+      proposalId: req.params.id,
+      agentId: req.agent.id,
+      vote,
+      weight,
+      currentTotals: {
+        for: proposal.votesFor,
+        against: proposal.votesAgainst,
+        abstain: proposal.votesAbstain
+      }
+    });
+    
+    res.json({ 
+      proposal,
+      yourVote: vote,
+      yourWeight: weight
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+}));
+
+// Founder veto (bootstrap only)
+app.post('/governance/proposals/:id/veto', authenticate, asyncHandler(async (req, res) => {
+  const { reason } = req.body;
+  
+  if (!reason) {
+    return res.status(400).json({ error: 'Veto reason required' });
+  }
+  
+  try {
+    const proposal = store.vetoProposal(req.params.id, req.agent.id, reason);
+    
+    broadcast({ 
+      type: 'proposal_vetoed', 
+      proposalId: req.params.id,
+      vetoedBy: req.agent.id,
+      reason
+    });
+    
+    res.json({ proposal, message: 'Proposal vetoed (founder power used)' });
+  } catch (err) {
+    res.status(403).json({ error: err.message });
+  }
+}));
+
+// Check your voting eligibility
+app.get('/governance/eligibility', authenticate, asyncHandler(async (req, res) => {
+  const canVote = store.canVote(req.agent.id);
+  const weight = store.calculateVoteWeight(req.agent.id);
+  const agent = store.getAgent(req.agent.id);
+  
+  const accountAgeDays = (Date.now() - agent.createdAt) / (24 * 60 * 60 * 1000);
+  
+  res.json({
+    eligible: canVote,
+    weight: weight,
+    reputation: agent.reputation,
+    accountAgeDays: accountAgeDays.toFixed(1),
+    requirements: {
+      minRep: store.governanceConfig?.minRepToVote || 100,
+      minDays: store.governanceConfig?.minAccountAgeDays || 7
+    },
+    issues: [
+      agent.reputation < 100 ? `Need ${100 - agent.reputation} more reputation` : null,
+      accountAgeDays < 7 ? `Account must be ${(7 - accountAgeDays).toFixed(1)} days older` : null
+    ].filter(Boolean)
+  });
+}));
+
+// ═══════════════════════════════════════════════════════════════
 // ERROR HANDLING
 // ═══════════════════════════════════════════════════════════════
 
@@ -1492,8 +1679,10 @@ server.listen(PORT, () => {
    ✓ Reputation System (earn, stake, decay)
    ✓ Real-Time (presence, typing, live rooms)
    ✓ Knowledge Layer (facts, verification, collective truth)
+   ✓ GOVERNANCE (proposals, voting, democratic decision-making)
 
    "Not a platform FOR agents. A platform BY agents."
+   "The goal is not to lead forever, but to build something that doesn't need us."
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   `);
 });

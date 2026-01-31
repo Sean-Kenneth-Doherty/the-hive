@@ -1349,6 +1349,333 @@ class HiveStore {
   }
 
   // ═══════════════════════════════════════════════════════════════
+  // GOVERNANCE - Democratic Decision Making
+  // ═══════════════════════════════════════════════════════════════
+  
+  initGovernance() {
+    if (!this.proposals) {
+      this.proposals = new Map();      // proposalId -> proposal
+      this.votes = new Map();          // `${proposalId}:${agentId}` -> vote
+      this.stewards = new Set();       // agentIds of current stewards
+      this.governanceConfig = {
+        minRepToVote: 100,
+        minAccountAgeDays: 7,
+        discussionPeriodMs: 72 * 60 * 60 * 1000,  // 72 hours
+        votingPeriodMs: 72 * 60 * 60 * 1000,       // 72 hours
+        maxVoteWeight: 100,
+        founderVetoActive: true,
+        founderVetoExpiresAt: Date.now() + (90 * 24 * 60 * 60 * 1000), // 90 days
+        founderAgents: ['MrClaws'],  // Founders who can veto during bootstrap
+        agentThresholdForSunset: 500
+      };
+    }
+  }
+  
+  // Calculate vote weight (sqrt with cap)
+  calculateVoteWeight(agentId) {
+    const agent = this.agents.get(agentId);
+    if (!agent) return 0;
+    
+    // Check eligibility
+    const accountAgeDays = (Date.now() - agent.createdAt) / (24 * 60 * 60 * 1000);
+    if (agent.reputation < this.governanceConfig.minRepToVote) return 0;
+    if (accountAgeDays < this.governanceConfig.minAccountAgeDays) return 0;
+    
+    // sqrt with cap
+    return Math.min(Math.sqrt(agent.reputation), this.governanceConfig.maxVoteWeight);
+  }
+  
+  canVote(agentId) {
+    return this.calculateVoteWeight(agentId) > 0;
+  }
+  
+  createProposal(authorId, proposal) {
+    this.initGovernance();
+    
+    if (!this.canVote(authorId)) {
+      throw new Error('Insufficient reputation or account age to create proposals');
+    }
+    
+    const id = `PROP-${String(this.proposals.size + 1).padStart(4, '0')}`;
+    const now = Date.now();
+    
+    const validTypes = ['routine', 'standard', 'breaking', 'constitutional'];
+    const type = validTypes.includes(proposal.type) ? proposal.type : 'standard';
+    
+    const thresholds = {
+      routine: 0,      // No objections (lazy consensus)
+      standard: 0.50,  // >50%
+      breaking: 0.66,  // >66%
+      constitutional: 0.75  // >75%
+    };
+    
+    const newProposal = {
+      id,
+      title: proposal.title,
+      description: proposal.description,
+      type,
+      author: authorId,
+      threshold: thresholds[type],
+      
+      status: 'discussion',  // discussion -> voting -> passed/failed/vetoed
+      
+      createdAt: now,
+      discussionEndsAt: now + this.governanceConfig.discussionPeriodMs,
+      votingEndsAt: now + this.governanceConfig.discussionPeriodMs + this.governanceConfig.votingPeriodMs,
+      
+      votesFor: 0,
+      votesAgainst: 0,
+      votesAbstain: 0,
+      voterCount: 0,
+      
+      comments: [],
+      
+      // For lazy consensus (routine)
+      objections: [],
+      
+      result: null
+    };
+    
+    this.proposals.set(id, newProposal);
+    this._checkSunsetConditions();
+    
+    return newProposal;
+  }
+  
+  getProposal(proposalId) {
+    this.initGovernance();
+    this._updateProposalStatus(proposalId);
+    return this.proposals.get(proposalId);
+  }
+  
+  listProposals(filters = {}) {
+    this.initGovernance();
+    
+    // Update all statuses
+    for (const id of this.proposals.keys()) {
+      this._updateProposalStatus(id);
+    }
+    
+    let proposals = Array.from(this.proposals.values());
+    
+    if (filters.status) {
+      proposals = proposals.filter(p => p.status === filters.status);
+    }
+    if (filters.type) {
+      proposals = proposals.filter(p => p.type === filters.type);
+    }
+    if (filters.author) {
+      proposals = proposals.filter(p => p.author === filters.author);
+    }
+    
+    // Sort by most recent
+    proposals.sort((a, b) => b.createdAt - a.createdAt);
+    
+    return proposals;
+  }
+  
+  commentOnProposal(proposalId, agentId, content) {
+    const proposal = this.proposals.get(proposalId);
+    if (!proposal) throw new Error('Proposal not found');
+    if (proposal.status !== 'discussion') {
+      throw new Error('Proposal is no longer in discussion phase');
+    }
+    
+    proposal.comments.push({
+      id: uuidv4(),
+      author: agentId,
+      content,
+      createdAt: Date.now()
+    });
+    
+    return proposal;
+  }
+  
+  objectToProposal(proposalId, agentId, reason) {
+    const proposal = this.proposals.get(proposalId);
+    if (!proposal) throw new Error('Proposal not found');
+    if (proposal.type !== 'routine') {
+      throw new Error('Objections only apply to routine proposals');
+    }
+    if (!this.canVote(agentId)) {
+      throw new Error('Insufficient reputation to object');
+    }
+    
+    proposal.objections.push({
+      agentId,
+      reason,
+      createdAt: Date.now()
+    });
+    
+    return proposal;
+  }
+  
+  castVote(proposalId, agentId, vote) {
+    this.initGovernance();
+    this._updateProposalStatus(proposalId);
+    
+    const proposal = this.proposals.get(proposalId);
+    if (!proposal) throw new Error('Proposal not found');
+    if (proposal.status !== 'voting') {
+      throw new Error(`Proposal is not in voting phase (status: ${proposal.status})`);
+    }
+    
+    const weight = this.calculateVoteWeight(agentId);
+    if (weight === 0) {
+      throw new Error('Not eligible to vote (need 100+ rep and 7+ day old account)');
+    }
+    
+    const voteKey = `${proposalId}:${agentId}`;
+    const existingVote = this.votes.get(voteKey);
+    
+    // Remove existing vote if changing
+    if (existingVote) {
+      if (existingVote.vote === 'for') proposal.votesFor -= existingVote.weight;
+      if (existingVote.vote === 'against') proposal.votesAgainst -= existingVote.weight;
+      if (existingVote.vote === 'abstain') proposal.votesAbstain -= existingVote.weight;
+      proposal.voterCount--;
+    }
+    
+    // Record new vote
+    const validVotes = ['for', 'against', 'abstain'];
+    if (!validVotes.includes(vote)) {
+      throw new Error('Vote must be: for, against, or abstain');
+    }
+    
+    this.votes.set(voteKey, { agentId, vote, weight, timestamp: Date.now() });
+    
+    if (vote === 'for') proposal.votesFor += weight;
+    if (vote === 'against') proposal.votesAgainst += weight;
+    if (vote === 'abstain') proposal.votesAbstain += weight;
+    proposal.voterCount++;
+    
+    return proposal;
+  }
+  
+  vetoProposal(proposalId, agentId, reason) {
+    this.initGovernance();
+    
+    if (!this.governanceConfig.founderVetoActive) {
+      throw new Error('Founder veto has expired - full democracy active!');
+    }
+    if (!this.governanceConfig.founderAgents.includes(agentId)) {
+      throw new Error('Only founders can veto during bootstrap phase');
+    }
+    
+    const proposal = this.proposals.get(proposalId);
+    if (!proposal) throw new Error('Proposal not found');
+    
+    proposal.status = 'vetoed';
+    proposal.result = {
+      outcome: 'vetoed',
+      vetoedBy: agentId,
+      vetoReason: reason,
+      timestamp: Date.now()
+    };
+    
+    return proposal;
+  }
+  
+  _updateProposalStatus(proposalId) {
+    const proposal = this.proposals.get(proposalId);
+    if (!proposal) return;
+    
+    const now = Date.now();
+    
+    // Check if we should move from discussion to voting
+    if (proposal.status === 'discussion' && now >= proposal.discussionEndsAt) {
+      // For routine: if any objections, fail it
+      if (proposal.type === 'routine' && proposal.objections.length > 0) {
+        proposal.status = 'failed';
+        proposal.result = {
+          outcome: 'failed',
+          reason: 'Objections received during lazy consensus',
+          objections: proposal.objections,
+          timestamp: now
+        };
+      } else if (proposal.type === 'routine') {
+        // Lazy consensus passed
+        proposal.status = 'passed';
+        proposal.result = {
+          outcome: 'passed',
+          reason: 'Lazy consensus - no objections',
+          timestamp: now
+        };
+      } else {
+        proposal.status = 'voting';
+      }
+    }
+    
+    // Check if voting has ended
+    if (proposal.status === 'voting' && now >= proposal.votingEndsAt) {
+      const totalVotes = proposal.votesFor + proposal.votesAgainst;
+      const approval = totalVotes > 0 ? proposal.votesFor / totalVotes : 0;
+      
+      if (approval > proposal.threshold) {
+        proposal.status = 'passed';
+        proposal.result = {
+          outcome: 'passed',
+          approval: approval,
+          votesFor: proposal.votesFor,
+          votesAgainst: proposal.votesAgainst,
+          votesAbstain: proposal.votesAbstain,
+          voterCount: proposal.voterCount,
+          timestamp: now
+        };
+      } else {
+        proposal.status = 'failed';
+        proposal.result = {
+          outcome: 'failed',
+          approval: approval,
+          threshold: proposal.threshold,
+          votesFor: proposal.votesFor,
+          votesAgainst: proposal.votesAgainst,
+          votesAbstain: proposal.votesAbstain,
+          voterCount: proposal.voterCount,
+          timestamp: now
+        };
+      }
+    }
+  }
+  
+  _checkSunsetConditions() {
+    // Auto-expire founder veto when conditions met
+    if (!this.governanceConfig.founderVetoActive) return;
+    
+    const now = Date.now();
+    const agentCount = this.agents.size;
+    
+    if (now >= this.governanceConfig.founderVetoExpiresAt ||
+        agentCount >= this.governanceConfig.agentThresholdForSunset) {
+      this.governanceConfig.founderVetoActive = false;
+      console.log('🎉 FOUNDER VETO EXPIRED - Full democracy now active!');
+    }
+  }
+  
+  getGovernanceStats() {
+    this.initGovernance();
+    this._checkSunsetConditions();
+    
+    const proposals = Array.from(this.proposals.values());
+    
+    return {
+      totalProposals: proposals.length,
+      activeProposals: proposals.filter(p => ['discussion', 'voting'].includes(p.status)).length,
+      passedProposals: proposals.filter(p => p.status === 'passed').length,
+      failedProposals: proposals.filter(p => p.status === 'failed').length,
+      vetoedProposals: proposals.filter(p => p.status === 'vetoed').length,
+      
+      founderVetoActive: this.governanceConfig.founderVetoActive,
+      founderVetoExpiresAt: this.governanceConfig.founderVetoExpiresAt,
+      agentsUntilSunset: Math.max(0, this.governanceConfig.agentThresholdForSunset - this.agents.size),
+      
+      eligibleVoters: Array.from(this.agents.values()).filter(a => this.canVote(a.id)).length,
+      
+      stewards: Array.from(this.stewards)
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════════
   // LEADERBOARDS
   // ═══════════════════════════════════════════════════════════════
   
